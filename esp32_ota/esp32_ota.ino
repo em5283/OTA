@@ -1,182 +1,200 @@
 #include <WiFi.h>
-#include <HTTPClient.h>
-#include <HTTPUpdate.h>
-#include <WiFiClientSecure.h>
-#include "cert.h"
+#include <Update.h>
 
-const char * ssid = "M2";
-const char * password = "123456789";
+WiFiClient client;
 
-#define LED_BUILTIN  2
-String FirmwareVer = {
-  "2.1"
-};
-#define URL_fw_Version "https://raw.githubusercontent.com/em5283/OTA/master/esp32_ota/bin_version.txt"
-#define URL_fw_Bin "https://raw.githubusercontent.com/em5283/OTA/master/esp32_ota/fw.bin"
+// Variables to validate
+// response from S3
+int contentLength = 0;
+bool isValidContentType = false;
 
-//#define URL_fw_Version "http://cade-make.000webhostapp.com/version.txt"
-//#define URL_fw_Bin "http://cade-make.000webhostapp.com/firmware.bin"
+// Your SSID and PSWD that the chip needs
+// to connect to
+const char* SSID = "M2";  
+const char* PSWD = "123456789";
 
-void connect_wifi();
-void firmwareUpdate();
-int FirmwareVersionCheck();
+// S3 Bucket Config
+String host = "raw.githubusercontent.com"; // Host => bucket-name.s3.region.amazonaws.com
+int port = 80; // Non https. For HTTPS 443. As of today, HTTPS doesn't work.
+String bin = "https://raw.githubusercontent.com/em5283/OTA/master/esp32_ota/fw.bin"; 
+// bin file name with a slash in front.
 
-unsigned long previousMillis = 0; // will store last time LED was updated
-unsigned long previousMillis_2 = 0;
-const long interval = 60000;
-const long mini_interval = 1000;
-void repeatedCall() {
-  static int num=0;
-  unsigned long currentMillis = millis();
-  if ((currentMillis - previousMillis) >= interval) {
-    // save the last time you blinked the LED
-    previousMillis = currentMillis;
-    if (FirmwareVersionCheck()) {
-      firmwareUpdate();
+
+// Utility to extract header value from headers
+String getHeaderValue(String header, String headerName) {
+  return header.substring(strlen(headerName.c_str()));
+}
+
+// OTA Logic
+void execOTA() {
+  Serial.println("Connecting to: " + String(host));
+  // Connect to S3
+  if (client.connect(host.c_str(), port)) {
+    // Connection Succeed.
+    // Fecthing the bin
+    Serial.println("Fetching Bin: " + String(bin));
+
+    // Get the contents of the bin file
+    client.print(String("GET ") + bin + " HTTP/1.1\r\n" +
+                 "Host: " + host + "\r\n" +
+                 "Cache-Control: no-cache\r\n" +
+                 "Connection: close\r\n\r\n");
+
+    // Check what is being sent
+    //    Serial.print(String("GET ") + bin + " HTTP/1.1\r\n" +
+    //                 "Host: " + host + "\r\n" +
+    //                 "Cache-Control: no-cache\r\n" +
+    //                 "Connection: close\r\n\r\n");
+
+    unsigned long timeout = millis();
+    while (client.available() == 0) {
+      if (millis() - timeout > 5000) {
+        Serial.println("Client Timeout !");
+        client.stop();
+        return;
+      }
     }
+    // Once the response is available,
+    // check stuff
+
+    /*
+       Response Structure
+        HTTP/1.1 200 OK
+        x-amz-id-2: NVKxnU1aIQMmpGKhSwpCBh8y2JPbak18QLIfE+OiUDOos+7UftZKjtCFqrwsGOZRN5Zee0jpTd0=
+        x-amz-request-id: 2D56B47560B764EC
+        Date: Wed, 14 Jun 2017 03:33:59 GMT
+        Last-Modified: Fri, 02 Jun 2017 14:50:11 GMT
+        ETag: "d2afebbaaebc38cd669ce36727152af9"
+        Accept-Ranges: bytes
+        Content-Type: application/octet-stream
+        Content-Length: 357280
+        Server: AmazonS3
+
+        {{BIN FILE CONTENTS}}
+    */
+    while (client.available()) {
+      // read line till /n
+      String line = client.readStringUntil('\n');
+      // remove space, to check if the line is end of headers
+      line.trim();
+
+      // if the the line is empty,
+      // this is end of headers
+      // break the while and feed the
+      // remaining `client` to the
+      // Update.writeStream();
+      if (!line.length()) {
+        //headers ended
+        break; // and get the OTA started
+      }
+
+      // Check if the HTTP Response is 200
+      // else break and Exit Update
+      if (line.startsWith("HTTP/1.1")) {
+        if (line.indexOf("200") < 0) {
+          Serial.println("Got a non 200 status code from server. Exiting OTA Update.");
+          break;
+        }
+      }
+
+      // extract headers here
+      // Start with content length
+      if (line.startsWith("Content-Length: ")) {
+        contentLength = atoi((getHeaderValue(line, "Content-Length: ")).c_str());
+        Serial.println("Got " + String(contentLength) + " bytes from server");
+      }
+
+      // Next, the content type
+      if (line.startsWith("Content-Type: ")) {
+        String contentType = getHeaderValue(line, "Content-Type: ");
+        Serial.println("Got " + contentType + " payload.");
+        if (contentType == "application/octet-stream") {
+          isValidContentType = true;
+        }
+      }
+    }
+
+  } else {
+    // Connect to S3 failed
+    // May be try?
+    // Probably a choppy network?
+    Serial.println("Connection to " + String(host) + " failed. Please check your setup");
+    // retry??
+    // execOTA();
   }
-  if ((currentMillis - previousMillis_2) >= mini_interval) {
-    previousMillis_2 = currentMillis;
-    Serial.print("idle loop...");
-    Serial.print(num++);
-    Serial.print(" Active fw version:");
-    Serial.println(FirmwareVer);
-   if(WiFi.status() == WL_CONNECTED) 
-   {
-       Serial.println("wifi connected");
-   }
-   else
-   {
-    connect_wifi();
-   }
+
+  // Check what is the contentLength and if content type is application/octet-stream
+  Serial.println("contentLength : " + String(contentLength) + ", isValidContentType : " + String(isValidContentType));
+
+  // check contentLength and content type
+  if (contentLength && isValidContentType) {
+    // Check if there is enough to OTA Update
+    bool canBegin = Update.begin(contentLength);
+
+    // If yes, begin
+    if (canBegin) {
+      Serial.println("Begin OTA. This may take 2 - 5 mins to complete. Things might be quite for a while.. Patience!");
+      // No activity would appear on the Serial monitor
+      // So be patient. This may take 2 - 5mins to complete
+      size_t written = Update.writeStream(client);
+
+      if (written == contentLength) {
+        Serial.println("Written : " + String(written) + " successfully");
+      } else {
+        Serial.println("Written only : " + String(written) + "/" + String(contentLength) + ". Retry?" );
+        // retry??
+        // execOTA();
+      }
+
+      if (Update.end()) {
+        Serial.println("OTA done!");
+        if (Update.isFinished()) {
+          Serial.println("Update successfully completed. Rebooting.");
+          ESP.restart();
+        } else {
+          Serial.println("Update not finished? Something went wrong!");
+        }
+      } else {
+        Serial.println("Error Occurred. Error #: " + String(Update.getError()));
+      }
+    } else {
+      // not enough space to begin OTA
+      // Understand the partitions and
+      // space availability
+      Serial.println("Not enough space to begin OTA");
+      client.flush();
+    }
+
+  } else {
+    Serial.println("There was no content in the response");
+    client.flush();
   }
 }
-
-struct Button {
-  const uint8_t PIN;
-  uint32_t numberKeyPresses;
-  bool pressed;
-};
-
-Button button_boot = {
-  0,
-  0,
-  false
-};
-/*void IRAM_ATTR isr(void* arg) {
-    Button* s = static_cast<Button*>(arg);
-    s->numberKeyPresses += 1;
-    s->pressed = true;
-}*/
-
-void IRAM_ATTR isr() {
-  button_boot.numberKeyPresses += 1;
-  button_boot.pressed = true;
-}
-
 
 void setup() {
-  pinMode(button_boot.PIN, INPUT);
-  attachInterrupt(button_boot.PIN, isr, RISING);
+  //Begin Serial
   Serial.begin(115200);
-  Serial.print("Active firmware version:");
-  Serial.println(FirmwareVer);
-  pinMode(LED_BUILTIN, OUTPUT);
-  connect_wifi();
-}
-void loop() {
-  if (button_boot.pressed) { //to connect wifi via Android esp touch app 
-    Serial.println("Firmware update Starting..");
-    firmwareUpdate();
-    button_boot.pressed = false;
-  }
-  repeatedCall();
-}
+  delay(10);
 
-void connect_wifi() {
-  Serial.println("Waiting for WiFi");
-  WiFi.begin(ssid, password);
+  Serial.println("Connecting to " + String(SSID));
+
+  // Connect to provided SSID and PSWD
+  WiFi.begin(SSID, PSWD);
+
+  // Wait for connection to establish
   while (WiFi.status() != WL_CONNECTED) {
+    Serial.print("."); // Keep the serial monitor lit!
     delay(500);
-    Serial.print(".");
   }
 
+  // Connection Succeed
   Serial.println("");
-  Serial.println("WiFi connected");
-  Serial.println("IP address: ");
-  Serial.println(WiFi.localIP());
+  Serial.println("Connected to " + String(SSID));
+
+  // Execute OTA Update
+  execOTA();
 }
 
-
-void firmwareUpdate(void) {
-  WiFiClientSecure client;
-  client.setCACert(rootCACertificate);
-  httpUpdate.setLedPin(LED_BUILTIN, LOW);
-  t_httpUpdate_return ret = httpUpdate.update(client, URL_fw_Bin);
-
-  switch (ret) {
-  case HTTP_UPDATE_FAILED:
-    Serial.printf("HTTP_UPDATE_FAILD Error (%d): %s\n", httpUpdate.getLastError(), httpUpdate.getLastErrorString().c_str());
-    break;
-
-  case HTTP_UPDATE_NO_UPDATES:
-    Serial.println("HTTP_UPDATE_NO_UPDATES");
-    break;
-
-  case HTTP_UPDATE_OK:
-    Serial.println("HTTP_UPDATE_OK");
-    break;
-  }
-}
-int FirmwareVersionCheck(void) {
-  String payload;
-  int httpCode;
-  String fwurl = "";
-  fwurl += URL_fw_Version;
-  fwurl += "?";
-  fwurl += String(rand());
-  Serial.println(fwurl);
-  WiFiClientSecure * client = new WiFiClientSecure;
-
-  if (client) 
-  {
-    client -> setCACert(rootCACertificate);
-
-    // Add a scoping block for HTTPClient https to make sure it is destroyed before WiFiClientSecure *client is 
-    HTTPClient https;
-
-    if (https.begin( * client, fwurl)) 
-    { // HTTPS      
-      Serial.print("[HTTPS] GET...\n");
-      // start connection and send HTTP header
-      delay(100);
-      httpCode = https.GET();
-      delay(100);
-      if (httpCode == HTTP_CODE_OK) // if version received
-      {
-        payload = https.getString(); // save received version
-      } else {
-        Serial.print("error in downloading version file:");
-        Serial.println(httpCode);
-      }
-      https.end();
-    }
-    delete client;
-  }
-      
-  if (httpCode == HTTP_CODE_OK) // if version received
-  {
-    payload.trim();
-    if (payload.equals(FirmwareVer)) {
-      Serial.printf("\nDevice already on latest firmware version:%s\n", FirmwareVer);
-      return 0;
-    } 
-    else 
-    {
-      Serial.println(payload);
-      Serial.println("New firmware detected");
-      return 1;
-    }
-  } 
-  return 0;  
+void loop() {
+  // chill
 }
